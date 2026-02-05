@@ -9,6 +9,9 @@ from typing import List, Optional, Union, Dict, Any
 
 # Import your classes
 from models import Qwen3VLEmbedder
+import base64
+from io import BytesIO
+from PIL import Image
 
 app = FastAPI()
 
@@ -35,66 +38,68 @@ class EmbeddingRequest(BaseModel):
 @app.post("/v1/embeddings")
 async def create_embedding(request: EmbeddingRequest):
     try:
-        batch_inputs = []
-        
         # 1. Normalize input to a list
         raw_input = request.input if isinstance(request.input, list) else [request.input]
+        batch_inputs = []
 
-        # 2. Process each item in the batch
         for item in raw_input:
-            # Case A: Item is already a Dictionary (e.g. via requests/custom client)
-            if isinstance(item, dict):
-                batch_inputs.append(item)
-            
-            # Case B: Item is a String (Standard OpenAI SDK constraint)
-            elif isinstance(item, str):
-                # Try to decode JSON string back to Dict (The "Trick")
+            # Handle the JSON-string trick from OpenAI SDK
+            if isinstance(item, str):
                 try:
-                    parsed = json.loads(item)
-                    if isinstance(parsed, dict):
-                        batch_inputs.append(parsed)
-                        continue
-                except (json.JSONDecodeError, TypeError):
-                    pass
-                
-                # If not JSON, treat as raw text or image URL heuristic
+                    item = json.loads(item)
+                except:
+                    pass 
+
+            # Prepare the dictionary for the model
+            model_item = {}
+            
+            # Helper to normalize input into {"text": ..., "image": ...}
+            # Handles raw strings (text/url) and dictionaries
+            if isinstance(item, str):
                 clean_item = item.strip()
-                if clean_item.startswith(('http:', 'https:', 'file:')) or \
-                   clean_item.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.bmp')):
-                    batch_inputs.append({"image": clean_item})
+                if clean_item.startswith(("http:", "https:")):
+                    model_item["image"] = clean_item
+                elif clean_item.startswith("data:image"): # Detect Base64 String
+                    header, encoded = clean_item.split(",", 1)
+                    image_data = base64.b64decode(encoded)
+                    model_item["image"] = Image.open(BytesIO(image_data)).convert("RGB")
                 else:
-                    batch_inputs.append({"text": clean_item})
+                    model_item["text"] = item
+            elif isinstance(item, dict):
+                if "text" in item:
+                    model_item["text"] = item["text"]
+                if "image" in item:
+                    img_val = item["image"]
+                    # INTERCEPT BASE64 STRING HERE
+                    if isinstance(img_val, str) and img_val.startswith("data:image"):
+                        header, encoded = img_val.split(",", 1)
+                        image_data = base64.b64decode(encoded)
+                        # CONVERT TO PIL IMAGE OBJECT
+                        model_item["image"] = Image.open(BytesIO(image_data)).convert("RGB")
+                    else:
+                        model_item["image"] = img_val # Keep URL/Path as string
 
-        # 3. Apply instruction if provided globally
-        if request.instruction:
-            for item in batch_inputs:
-                # Only apply if the item didn't have its own instruction
-                if "instruction" not in item:
-                    item["instruction"] = request.instruction
+            # Apply instruction if present
+            if request.instruction and "instruction" not in model_item:
+                model_item["instruction"] = request.instruction
+                
+            batch_inputs.append(model_item)
 
-        # 4. Generate Embeddings
-        # The Qwen3VLEmbedder.process method accepts a list of dicts
+        # 2. Pass the list of dicts (now containing PIL objects) to the model
+        embeddings = embedder.process(batch_inputs)
         
-        embeddings_tensor = embedder.process(batch_inputs)
-        
-        # 5. Format Response to match OpenAI Spec
-        data_response = []
-        for i, emb in enumerate(embeddings_tensor):
-            data_response.append({
-                "object": "embedding",
-                "embedding": emb.tolist(),
-                "index": i
-            })
-
+        # 3. Return response (Standard OpenAI Format)
         return {
             "object": "list",
-            "data": data_response,
+            "data": [
+                {"object": "embedding", "embedding": emb.tolist(), "index": i} 
+                for i, emb in enumerate(embeddings)
+            ],
             "model": request.model,
             "usage": {"prompt_tokens": 0, "total_tokens": 0}
         }
 
     except Exception as e:
-        # Print full trace for debugging server-side
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
